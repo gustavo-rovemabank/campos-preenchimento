@@ -77,6 +77,83 @@ def are_overlapping(rect1, rect2, threshold=0.8):
     overlap_pct = intersect.get_area() / smaller_area
     return overlap_pct >= threshold
 
+def extract_fillable_lines(page, paths, existing_boxes=None):
+    """
+    Detecta exclusivamente linhas horizontais autênticas de preenchimento e assinatura (ex: Cidade, Data, Assinaturas).
+    Filtra rigorosamente:
+    - Traços que compõem caixas, tabelas ou retângulos arredondados (exige altura da forma <= 2.5 pt).
+    - Divisores de seção de largura quase total (> 80% da largura da página).
+    - Bordas externas de cabeçalho e rodapé.
+    - Exige a presença de rótulo explicativo diretamente abaixo (ou à esquerda) da linha (ex: 'CIDADE', 'DIA', 'RESPONSÁVEL').
+    - Garante que o espaço acima da linha esteja livre para digitação.
+    - Evita duplicar campos com caixas já detectadas no passo anterior.
+    """
+    page_w = page.rect.width
+    page_h = page.rect.height
+    candidate_lines = []
+
+    for p in paths:
+        r = p['rect']
+        # Deve ser um traço fino isolado (não uma caixa ou tabela)
+        if r.height > 2.5:
+            continue
+        width = r.width
+        if width < 15:
+            continue
+        # Ignora réguas/divisores de página quase inteira (> 80% da página)
+        if width > page_w * 0.80:
+            continue
+        y = (r.y0 + r.y1) / 2
+        # Ignora margens extremas de topo e rodapé
+        if y < 40 or y > page_h - 35:
+            continue
+
+        # Rótulo abaixo da linha (ex: CIDADE, DIA, MÊS, RESPONSÁVEL, CREDENCIADO, CARGO)
+        label_rect = fitz.Rect(r.x0 - 5, y, r.x1 + 5, min(page_h, y + 22))
+        label_text = page.get_text("text", clip=label_rect).strip()
+
+        # Rótulo à esquerda da linha (ex: Nome: _______)
+        left_rect = fitz.Rect(max(0, r.x0 - 120), y - 10, r.x0, y + 10)
+        left_text = page.get_text("text", clip=left_rect).strip()
+
+        # Linha para escrita DEVE possuir identificação de rótulo
+        if not label_text and not left_text:
+            continue
+
+        # Espaço acima da linha deve estar desobstruído para digitação
+        field_h = 18.0
+        field_rect = fitz.Rect(r.x0, y - field_h, r.x1, y)
+        check_above = fitz.Rect(r.x0 + 1, y - 14, r.x1 - 1, y - 1)
+        if page.get_text("text", clip=check_above).strip():
+            continue
+
+        # Evita conflitos com caixas sombreadas já tratadas
+        if existing_boxes:
+            overlaps_box = False
+            for b in existing_boxes:
+                b_rect = b[0] if isinstance(b, tuple) else b
+                inter = field_rect & b_rect
+                if not inter.is_empty and inter.get_area() > 0.4 * min(field_rect.get_area(), b_rect.get_area()):
+                    overlaps_box = True
+                    break
+            if overlaps_box:
+                continue
+
+        candidate_lines.append((field_rect, y))
+
+    # Deduplicação de linhas muito próximas
+    unique_lines = []
+    for f_rect, y in candidate_lines:
+        is_dup = False
+        for ex_rect, ex_y in unique_lines:
+            if abs(y - ex_y) <= 2.0 and abs(f_rect.x0 - ex_rect.x0) < 5 and abs(f_rect.x1 - ex_rect.x1) < 5:
+                is_dup = True
+                break
+        if not is_dup:
+            unique_lines.append((f_rect, y))
+
+    return unique_lines
+
 def process_pdf(input_stream):
     doc = fitz.open(stream=input_stream, filetype="pdf")
     
@@ -152,25 +229,22 @@ def process_pdf(input_stream):
                     # Adiciona ao replacements como uma tupla contendo o retângulo e uma flag indicando se é círculo
                     replacements.append((rect, is_circle))
 
-        # 1.5 Deduplicação e Ordenação
-        if not replacements:
-            continue
-
-        # Deduplicação: Remove retângulos que se sobrepõem muito
+        # 1.5 Deduplicação e Ordenação de retângulos sombreados
         unique_replacements = []
-        for r_tuple in replacements:
-            r = r_tuple[0]
-            is_dup = False
-            for existing_tuple in unique_replacements:
-                existing = existing_tuple[0]
-                if are_overlapping(r, existing):
-                    is_dup = True
-                    break
-            if not is_dup:
-                unique_replacements.append(r_tuple)
-        
-        # Ordenação: Topo para Baixo, Esquerda para Direita
-        unique_replacements.sort(key=lambda r_t: (round(r_t[0].y0 / 5) * 5, r_t[0].x0))
+        if replacements:
+            for r_tuple in replacements:
+                r = r_tuple[0]
+                is_dup = False
+                for existing_tuple in unique_replacements:
+                    existing = existing_tuple[0]
+                    if are_overlapping(r, existing):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique_replacements.append(r_tuple)
+            
+            # Ordenação: Topo para Baixo, Esquerda para Direita
+            unique_replacements.sort(key=lambda r_t: (round(r_t[0].y0 / 5) * 5, r_t[0].x0))
 
         # 1.6 Classificar e Agrupar
         # (Nesta versão otimizada para estabilidade, mantemos os campos como Checkboxes)
@@ -237,6 +311,19 @@ def process_pdf(input_stream):
                 widget.text_font = font_name
                 widget.text_fontsize = max(8, height * 0.6)
                 page.add_widget(widget)
+
+        # 4. Criar campos de texto sobre linhas horizontais autênticas de preenchimento e assinatura
+        fillable_lines = extract_fillable_lines(page, paths, existing_boxes=unique_replacements)
+        
+        for idx, (field_rect, line_y) in enumerate(fillable_lines):
+            widget = fitz.Widget()
+            widget.rect = field_rect
+            widget.field_name = f"line_input_p{page.number}_{idx}_{int(field_rect.x0)}_{int(line_y)}"
+            widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+            widget.text_font = font_name
+            widget.text_fontsize = 10
+            widget.border_width = 0
+            page.add_widget(widget)
 
     output_buffer = io.BytesIO()
     doc.save(output_buffer)
